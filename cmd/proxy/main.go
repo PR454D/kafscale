@@ -33,6 +33,7 @@ import (
 
 	"github.com/KafScale/platform/pkg/metadata"
 	"github.com/KafScale/platform/pkg/protocol"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -58,6 +59,9 @@ type proxy struct {
 	groupRouter    *metadata.GroupRouter
 	brokerAddrMu   sync.RWMutex
 	brokerAddrs    map[string]string // brokerID -> "host:port"
+	topicNamesMu   sync.RWMutex
+	topicNames     map[[16]byte]string // topicID -> topic name
+	metaFlight     singleflight.Group
 	backendRetries int
 	backendBackoff time.Duration
 }
@@ -112,6 +116,7 @@ func main() {
 		cacheTTL:       cacheTTL,
 		apiVersions:    generateProxyApiVersions(),
 		brokerAddrs:    make(map[string]string),
+		topicNames:     make(map[[16]byte]string),
 		backendRetries: backendRetries,
 		backendBackoff: backendBackoff,
 	}
@@ -137,7 +142,7 @@ func main() {
 		p.touchHealthy()
 		p.setReady(true)
 	}
-	p.startBackendRefresh(ctx, backendBackoff)
+	p.initMetadataCache(ctx)
 	if healthAddr != "" {
 		p.startHealthServer(ctx, healthAddr)
 	}
@@ -270,7 +275,7 @@ func (p *proxy) setReady(ready bool) {
 }
 
 func (p *proxy) isReady() bool {
-	return atomic.LoadUint32(&p.ready) == 1 && p.cacheFresh()
+	return atomic.LoadUint32(&p.ready) == 1
 }
 
 func (p *proxy) setCachedBackends(backends []string) {
@@ -308,56 +313,33 @@ func (p *proxy) cacheFresh() bool {
 	return time.Since(time.Unix(0, last)) <= p.cacheTTL
 }
 
-func (p *proxy) startBackendRefresh(ctx context.Context, backoff time.Duration) {
+// checkReady uses cached state when fresh, falling back to a live metadata
+// fetch only when the cache TTL has expired (e.g. no traffic for >60s).
+func (p *proxy) checkReady(ctx context.Context) bool {
+	if len(p.backends) > 0 {
+		return true
+	}
+	if p.cacheFresh() {
+		return true
+	}
+	if p.store == nil {
+		return false
+	}
+	backends, err := p.currentBackends(ctx)
+	return err == nil && len(backends) > 0
+}
+
+func (p *proxy) initMetadataCache(ctx context.Context) {
 	if p.store == nil {
 		return
 	}
-	if backoff <= 0 {
-		backoff = 500 * time.Millisecond
-	}
-	// Eagerly populate broker ID -> address mapping before accepting connections.
-	p.refreshBrokerAddrs(ctx)
-	ticker := time.NewTicker(3 * time.Second)
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if len(p.backends) > 0 {
-					// Static backends: only refresh broker ID mapping.
-					p.refreshBrokerAddrs(ctx)
-					continue
-				}
-				_, err := p.refreshBackends(ctx)
-				if err != nil {
-					if !p.cacheFresh() {
-						p.setReady(false)
-					}
-					time.Sleep(backoff)
-				}
-			}
-		}
-	}()
-}
-
-func (p *proxy) refreshBackends(ctx context.Context) ([]string, error) {
-	backends, err := p.currentBackends(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if len(backends) > 0 {
-		p.touchHealthy()
-		p.setReady(true)
-	}
-	return backends, nil
+	p.refreshMetadataCache(ctx)
 }
 
 func (p *proxy) startHealthServer(ctx context.Context, addr string) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if p.isReady() || (len(p.cachedBackendsSnapshot()) > 0 && p.cacheFresh()) {
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if p.checkReady(r.Context()) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ready\n"))
 			return
@@ -467,6 +449,18 @@ func (p *proxy) handleConnection(ctx context.Context, conn net.Conn) {
 			}
 			if err := protocol.WriteFrame(conn, resp); err != nil {
 				p.logger.Warn("write produce response failed", "error", err)
+				return
+			}
+			continue
+		case protocol.APIKeyFetch:
+			resp, err := p.handleFetchRouting(ctx, header, frame.Payload, pool)
+			if err != nil {
+				p.logger.Warn("fetch routing failed", "error", err)
+				p.respondBackendError(conn, header, frame.Payload)
+				return
+			}
+			if err := protocol.WriteFrame(conn, resp); err != nil {
+				p.logger.Warn("write fetch response failed", "error", err)
 				return
 			}
 			continue
@@ -587,7 +581,7 @@ func (p *proxy) handleProduceRouting(ctx context.Context, header *protocol.Reque
 		return nil, nil
 	}
 
-	groups := p.groupPartitionsByBroker(produceReq, nil)
+	groups := p.groupPartitionsByBroker(ctx, produceReq, nil)
 	return p.forwardProduce(ctx, header, produceReq, payload, groups, pool)
 }
 
@@ -611,7 +605,7 @@ func (p *proxy) forwardProduceRaw(ctx context.Context, payload []byte, pool *con
 // response. Used for acks=0 produces where the Kafka protocol specifies no
 // server response.
 func (p *proxy) fireAndForgetProduce(ctx context.Context, header *protocol.RequestHeader, req *protocol.ProduceRequest, originalPayload []byte, pool *connPool) {
-	groups := p.groupPartitionsByBroker(req, nil)
+	groups := p.groupPartitionsByBroker(ctx, req, nil)
 
 	for addr, subReq := range groups {
 		var payload []byte
@@ -643,7 +637,7 @@ func (p *proxy) fireAndForgetProduce(ctx context.Context, header *protocol.Reque
 // groupPartitionsByBroker groups topic-partitions by the owning broker's address.
 // If include is non-nil, only partitions present in the include map are grouped.
 // Partitions with no known owner are grouped under "" for round-robin fallback.
-func (p *proxy) groupPartitionsByBroker(req *protocol.ProduceRequest, include map[string]map[int32]bool) map[string]*protocol.ProduceRequest {
+func (p *proxy) groupPartitionsByBroker(ctx context.Context, req *protocol.ProduceRequest, include map[string]map[int32]bool) map[string]*protocol.ProduceRequest {
 	groups := make(map[string]*protocol.ProduceRequest)
 	topicIndices := make(map[string]map[string]int) // addr -> topic name -> index in subReq.Topics
 
@@ -662,7 +656,7 @@ func (p *proxy) groupPartitionsByBroker(req *protocol.ProduceRequest, include ma
 			addr := ""
 			if p.router != nil {
 				if ownerID := p.router.LookupOwner(topic.Name, part.Partition); ownerID != "" {
-					addr = p.brokerIDToAddr(ownerID)
+					addr = p.brokerIDToAddr(ctx, ownerID)
 				}
 			}
 			subReq, ok := groups[addr]
@@ -744,7 +738,7 @@ func (p *proxy) forwardProduce(ctx context.Context, header *protocol.RequestHead
 			return protocol.EncodeProduceResponse(merged, header.APIVersion)
 		}
 
-		groups = p.groupPartitionsByBroker(fullReq, failedPartitions)
+		groups = p.groupPartitionsByBroker(ctx, fullReq, failedPartitions)
 		originalPayload = nil // force re-encoding on retry
 		if len(groups) == 0 {
 			break
@@ -881,9 +875,18 @@ func addErrorForAllPartitions(resp *protocol.ProduceResponse, req *protocol.Prod
 	}
 }
 
-func (p *proxy) brokerIDToAddr(brokerID string) string {
+// brokerIDToAddr resolves broker ID to address. Triggers a metadata fetch on
+// cache miss.
+func (p *proxy) brokerIDToAddr(ctx context.Context, brokerID string) string {
 	p.brokerAddrMu.RLock()
 	addr := p.brokerAddrs[brokerID]
+	p.brokerAddrMu.RUnlock()
+	if addr != "" {
+		return addr
+	}
+	p.refreshMetadataCache(ctx)
+	p.brokerAddrMu.RLock()
+	addr = p.brokerAddrs[brokerID]
 	p.brokerAddrMu.RUnlock()
 	return addr
 }
@@ -1487,6 +1490,7 @@ func (p *proxy) currentBackends(ctx context.Context) ([]string, error) {
 		p.setReady(true)
 	}
 	p.updateBrokerAddrs(meta.Brokers)
+	p.updateTopicNames(meta.Topics)
 	return addrs, nil
 }
 
@@ -1504,18 +1508,50 @@ func (p *proxy) updateBrokerAddrs(brokers []protocol.MetadataBroker) {
 	p.brokerAddrMu.Unlock()
 }
 
-// refreshBrokerAddrs queries metadata solely to update the broker ID -> address
-// mapping. Used when static backends are configured (so currentBackends returns
-// early) but partition-aware routing still needs broker ID resolution.
-func (p *proxy) refreshBrokerAddrs(ctx context.Context) {
+// refreshMetadataCache updates broker address and topic name caches from
+// metadata. Concurrent calls are coalesced via singleflight.
+func (p *proxy) refreshMetadataCache(ctx context.Context) {
 	if p.store == nil {
 		return
 	}
-	meta, err := p.store.Metadata(ctx, nil)
-	if err != nil {
-		return
+	p.metaFlight.Do("refresh", func() (interface{}, error) {
+		meta, err := p.store.Metadata(ctx, nil)
+		if err != nil {
+			return nil, err
+		}
+		p.updateBrokerAddrs(meta.Brokers)
+		p.updateTopicNames(meta.Topics)
+		p.touchHealthy()
+		return nil, nil
+	})
+}
+
+func (p *proxy) updateTopicNames(topics []protocol.MetadataTopic) {
+	names := make(map[[16]byte]string, len(topics))
+	var zeroID [16]byte
+	for _, topic := range topics {
+		if topic.TopicID != zeroID && topic.Name != "" {
+			names[topic.TopicID] = topic.Name
+		}
 	}
-	p.updateBrokerAddrs(meta.Brokers)
+	p.topicNamesMu.Lock()
+	p.topicNames = names
+	p.topicNamesMu.Unlock()
+}
+
+// resolveTopicID maps topic UUID to name. Triggers a metadata fetch on cache miss.
+func (p *proxy) resolveTopicID(ctx context.Context, id [16]byte) string {
+	p.topicNamesMu.RLock()
+	name := p.topicNames[id]
+	p.topicNamesMu.RUnlock()
+	if name != "" {
+		return name
+	}
+	p.refreshMetadataCache(ctx)
+	p.topicNamesMu.RLock()
+	name = p.topicNames[id]
+	p.topicNamesMu.RUnlock()
+	return name
 }
 
 func (p *proxy) forwardToBackend(ctx context.Context, conn net.Conn, backendAddr string, payload []byte) ([]byte, error) {
@@ -1529,18 +1565,12 @@ func (p *proxy) forwardToBackend(ctx context.Context, conn net.Conn, backendAddr
 	return frame.Payload, nil
 }
 
-// handleGroupRouting routes group-related requests to the broker that owns the
-// group coordination lease. If no owner is cached, or the owner returns
-// NOT_COORDINATOR, the request is retried on a different broker.
-//
-// DescribeGroups requests are forwarded once without retry since different
-// groups may live on different brokers. The broker returns per-group
-// NOT_COORDINATOR errors that the Kafka client handles natively.
+// handleGroupRouting forwards group requests to the coordination lease owner,
+// retrying on NOT_COORDINATOR. DescribeGroups is forwarded once without retry
+// since it may span multiple groups on different brokers.
 func (p *proxy) handleGroupRouting(ctx context.Context, header *protocol.RequestHeader, payload []byte, pool *connPool) ([]byte, error) {
 	groupID := p.extractGroupID(header.APIKey, payload)
 
-	// DescribeGroups with multiple groups cannot be reliably split/retried at
-	// the proxy level. Forward once and let the client handle per-group errors.
 	maxAttempts := 3
 	if header.APIKey == protocol.APIKeyDescribeGroups {
 		maxAttempts = 1
@@ -1552,7 +1582,7 @@ func (p *proxy) handleGroupRouting(ctx context.Context, header *protocol.Request
 		targetAddr := ""
 		if p.groupRouter != nil && groupID != "" {
 			if ownerID := p.groupRouter.LookupOwner(groupID); ownerID != "" {
-				targetAddr = p.brokerIDToAddr(ownerID)
+				targetAddr = p.brokerIDToAddr(ctx, ownerID)
 			}
 		}
 
@@ -1585,8 +1615,6 @@ func (p *proxy) handleGroupRouting(ctx context.Context, header *protocol.Request
 	return nil, fmt.Errorf("group request for %q failed after %d attempts", groupID, maxAttempts)
 }
 
-// extractGroupID parses the request payload to extract the group ID for routing.
-// Returns "" if the group ID cannot be determined.
 func (p *proxy) extractGroupID(apiKey int16, payload []byte) string {
 	_, req, err := protocol.ParseRequest(payload)
 	if err != nil {
@@ -1612,5 +1640,304 @@ func (p *proxy) extractGroupID(apiKey int16, payload []byte) string {
 		return ""
 	default:
 		return ""
+	}
+}
+
+// handleFetchRouting splits fetch requests by partition owner, fans out, and
+// merges responses. Retries NOT_LEADER_OR_FOLLOWER on a different broker.
+func (p *proxy) handleFetchRouting(ctx context.Context, header *protocol.RequestHeader, payload []byte, pool *connPool) ([]byte, error) {
+	_, req, err := protocol.ParseRequest(payload)
+	if err != nil {
+		return p.forwardFetchRaw(ctx, payload, pool)
+	}
+	fetchReq, ok := req.(*protocol.FetchRequest)
+	if !ok || len(fetchReq.Topics) == 0 {
+		return p.forwardFetchRaw(ctx, payload, pool)
+	}
+
+	p.resolveFetchTopicNames(ctx, fetchReq)
+
+	groups := p.groupFetchPartitionsByBroker(ctx, fetchReq, nil)
+	return p.forwardFetch(ctx, header, fetchReq, payload, groups, pool)
+}
+
+// forwardFetchRaw forwards an unparseable fetch payload to any backend.
+func (p *proxy) forwardFetchRaw(ctx context.Context, payload []byte, pool *connPool) ([]byte, error) {
+	conn, addr, err := p.connectForAddr(ctx, "", nil, pool)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := p.forwardToBackend(ctx, conn, addr, payload)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	pool.Return(addr, conn)
+	return resp, nil
+}
+
+// resolveFetchTopicNames resolves topic IDs to names so the partition router
+// (which is keyed by name) can look up owners for v12+ requests.
+func (p *proxy) resolveFetchTopicNames(ctx context.Context, req *protocol.FetchRequest) {
+	var zeroID [16]byte
+	for i := range req.Topics {
+		if req.Topics[i].Name == "" && req.Topics[i].TopicID != zeroID {
+			req.Topics[i].Name = p.resolveTopicID(ctx, req.Topics[i].TopicID)
+		}
+	}
+}
+
+// fetchTopicKey returns name when available, or hex topic ID as fallback.
+// Prevents unresolved v12+ topics (all name="") from colliding in maps.
+func fetchTopicKey(name string, id [16]byte) string {
+	if name != "" {
+		return name
+	}
+	return fmt.Sprintf("id:%x", id)
+}
+
+// groupFetchPartitionsByBroker groups partitions by owning broker. If include
+// is non-nil, only listed partitions are grouped. Unknown owners go under ""
+// for round-robin.
+func (p *proxy) groupFetchPartitionsByBroker(ctx context.Context, req *protocol.FetchRequest, include map[string]map[int32]bool) map[string]*protocol.FetchRequest {
+	groups := make(map[string]*protocol.FetchRequest)
+	topicIndices := make(map[string]map[string]int) // addr -> topicKey -> index in subReq.Topics
+
+	for _, topic := range req.Topics {
+		topicName := topic.Name
+		key := fetchTopicKey(topicName, topic.TopicID)
+		var includeParts map[int32]bool
+		if include != nil {
+			includeParts = include[key]
+			if len(includeParts) == 0 {
+				continue
+			}
+		}
+		for _, part := range topic.Partitions {
+			if includeParts != nil && !includeParts[part.Partition] {
+				continue
+			}
+			addr := ""
+			if p.router != nil && topicName != "" {
+				if ownerID := p.router.LookupOwner(topicName, part.Partition); ownerID != "" {
+					addr = p.brokerIDToAddr(ctx, ownerID)
+				}
+			}
+			subReq, ok := groups[addr]
+			if !ok {
+				subReq = &protocol.FetchRequest{
+					ReplicaID:      req.ReplicaID,
+					MaxWaitMs:      req.MaxWaitMs,
+					MinBytes:       req.MinBytes,
+					MaxBytes:       req.MaxBytes,
+					IsolationLevel: req.IsolationLevel,
+					SessionID:      req.SessionID,
+					SessionEpoch:   req.SessionEpoch,
+				}
+				groups[addr] = subReq
+				topicIndices[addr] = make(map[string]int)
+			}
+			idx, ok := topicIndices[addr][key]
+			if !ok {
+				idx = len(subReq.Topics)
+				subReq.Topics = append(subReq.Topics, protocol.FetchTopicRequest{
+					Name:    topic.Name,
+					TopicID: topic.TopicID,
+				})
+				topicIndices[addr][key] = idx
+			}
+			subReq.Topics[idx].Partitions = append(subReq.Topics[idx].Partitions, part)
+		}
+	}
+	return groups
+}
+
+type fetchFanOutResult struct {
+	subReq  *protocol.FetchRequest
+	subResp *protocol.FetchResponse
+	conn    net.Conn
+	target  string
+	err     error
+}
+
+// forwardFetch fans out sub-requests, merges responses, and retries
+// NOT_LEADER_OR_FOLLOWER partitions on a different broker.
+func (p *proxy) forwardFetch(ctx context.Context, header *protocol.RequestHeader, fullReq *protocol.FetchRequest, originalPayload []byte, groups map[string]*protocol.FetchRequest, pool *connPool) ([]byte, error) {
+	const maxRetries = 3
+
+	merged := &protocol.FetchResponse{
+		CorrelationID: header.CorrelationID,
+		SessionID:     fullReq.SessionID,
+	}
+
+	// Keyed by fetchTopicKey to avoid collisions among unresolved v12+ topics.
+	var failedPartitions map[string]map[int32]bool
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		failedPartitions = nil
+		// Reset per attempt so retries can revisit brokers from earlier attempts.
+		triedBackends := make(map[string]bool)
+		subResults := p.fanOutFetch(ctx, header, groups, originalPayload, triedBackends, pool)
+
+		for _, r := range subResults {
+			if r.err != nil {
+				p.logger.Warn("fetch forward failed", "target", r.target, "error", r.err)
+				addFetchErrorForAllPartitions(merged, r.subReq, protocol.REQUEST_TIMED_OUT)
+				continue
+			}
+			if r.conn != nil {
+				pool.Return(r.target, r.conn)
+			}
+			if r.subResp.ErrorCode != 0 {
+				merged.ErrorCode = r.subResp.ErrorCode
+			}
+			for _, topic := range r.subResp.Topics {
+				for _, part := range topic.Partitions {
+					if part.ErrorCode == protocol.NOT_LEADER_OR_FOLLOWER {
+						topicName := topic.Name
+						if topicName == "" {
+							topicName = p.resolveTopicID(ctx, topic.TopicID)
+						}
+						key := fetchTopicKey(topicName, topic.TopicID)
+						if failedPartitions == nil {
+							failedPartitions = make(map[string]map[int32]bool)
+						}
+						if failedPartitions[key] == nil {
+							failedPartitions[key] = make(map[int32]bool)
+						}
+						failedPartitions[key][part.Partition] = true
+						if p.router != nil && topicName != "" {
+							p.router.Invalidate(topicName, part.Partition)
+						}
+					} else {
+						tr := findOrAddFetchTopicResponse(merged, topic.Name, topic.TopicID)
+						tr.Partitions = append(tr.Partitions, part)
+					}
+				}
+			}
+			if r.subResp.ThrottleMs > merged.ThrottleMs {
+				merged.ThrottleMs = r.subResp.ThrottleMs
+			}
+		}
+
+		if len(failedPartitions) == 0 {
+			return protocol.EncodeFetchResponse(merged, header.APIVersion)
+		}
+
+		groups = p.groupFetchPartitionsByBroker(ctx, fullReq, failedPartitions)
+		originalPayload = nil
+		if len(groups) == 0 {
+			break
+		}
+		p.logger.Debug("retrying NOT_LEADER fetch partitions", "attempt", attempt+1, "partitions", len(failedPartitions))
+	}
+
+	for _, topic := range fullReq.Topics {
+		key := fetchTopicKey(topic.Name, topic.TopicID)
+		failedParts, ok := failedPartitions[key]
+		if !ok {
+			continue
+		}
+		tr := findOrAddFetchTopicResponse(merged, topic.Name, topic.TopicID)
+		for _, part := range topic.Partitions {
+			if failedParts[part.Partition] {
+				tr.Partitions = append(tr.Partitions, protocol.FetchPartitionResponse{
+					Partition: part.Partition,
+					ErrorCode: protocol.NOT_LEADER_OR_FOLLOWER,
+				})
+			}
+		}
+	}
+	return protocol.EncodeFetchResponse(merged, header.APIVersion)
+}
+
+// fanOutFetch borrows connections and forwards fetch sub-requests concurrently.
+func (p *proxy) fanOutFetch(ctx context.Context, header *protocol.RequestHeader, groups map[string]*protocol.FetchRequest, originalPayload []byte, triedBackends map[string]bool, pool *connPool) []fetchFanOutResult {
+	type workItem struct {
+		subReq  *protocol.FetchRequest
+		conn    net.Conn
+		target  string
+		payload []byte
+	}
+	work := make([]workItem, 0, len(groups))
+	var connectErrors []fetchFanOutResult
+
+	canUseOriginal := originalPayload != nil && len(groups) == 1
+	for addr, subReq := range groups {
+		conn, targetAddr, err := p.connectForAddr(ctx, addr, triedBackends, pool)
+		if err != nil {
+			connectErrors = append(connectErrors, fetchFanOutResult{subReq: subReq, target: addr, err: err})
+			continue
+		}
+		triedBackends[targetAddr] = true
+
+		var payload []byte
+		if canUseOriginal {
+			payload = originalPayload
+		} else {
+			encoded, encErr := protocol.EncodeFetchRequest(header, subReq, header.APIVersion)
+			if encErr != nil {
+				conn.Close()
+				connectErrors = append(connectErrors, fetchFanOutResult{subReq: subReq, target: targetAddr, err: encErr})
+				continue
+			}
+			payload = encoded
+		}
+		work = append(work, workItem{subReq: subReq, conn: conn, target: targetAddr, payload: payload})
+	}
+
+	results := make([]fetchFanOutResult, len(work))
+	var wg sync.WaitGroup
+	for i := range work {
+		i := i
+		w := work[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			respBytes, err := p.forwardToBackend(ctx, w.conn, w.target, w.payload)
+			if err != nil {
+				w.conn.Close()
+				results[i] = fetchFanOutResult{subReq: w.subReq, target: w.target, err: err}
+				return
+			}
+			subResp, parseErr := protocol.ParseFetchResponse(respBytes, header.APIVersion)
+			if parseErr != nil {
+				w.conn.Close()
+				results[i] = fetchFanOutResult{subReq: w.subReq, target: w.target, err: parseErr}
+				return
+			}
+			results[i] = fetchFanOutResult{subReq: w.subReq, subResp: subResp, conn: w.conn, target: w.target}
+		}()
+	}
+	wg.Wait()
+
+	return append(connectErrors, results...)
+}
+
+func findOrAddFetchTopicResponse(resp *protocol.FetchResponse, name string, topicID [16]byte) *protocol.FetchTopicResponse {
+	var zeroID [16]byte
+	for i := range resp.Topics {
+		if topicID != zeroID {
+			if resp.Topics[i].TopicID == topicID {
+				return &resp.Topics[i]
+			}
+		} else {
+			if resp.Topics[i].Name == name {
+				return &resp.Topics[i]
+			}
+		}
+	}
+	resp.Topics = append(resp.Topics, protocol.FetchTopicResponse{Name: name, TopicID: topicID})
+	return &resp.Topics[len(resp.Topics)-1]
+}
+
+func addFetchErrorForAllPartitions(resp *protocol.FetchResponse, req *protocol.FetchRequest, errorCode int16) {
+	for _, topic := range req.Topics {
+		tr := findOrAddFetchTopicResponse(resp, topic.Name, topic.TopicID)
+		for _, part := range topic.Partitions {
+			tr.Partitions = append(tr.Partitions, protocol.FetchPartitionResponse{
+				Partition: part.Partition,
+				ErrorCode: errorCode,
+			})
+		}
 	}
 }
